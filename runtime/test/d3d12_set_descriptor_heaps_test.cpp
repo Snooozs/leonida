@@ -337,7 +337,21 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     const auto di_flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                           D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
     rs_desc.Desc_1_0 = {1, &p, 0, nullptr, di_flags};
-    const auto blob = d3d12test::serialize_root_signature(rs_desc);
+    auto blob = d3d12test::serialize_root_signature(rs_desc);
+    if (blob.empty()) {
+        // The heap-direct bits came with Shader Model 6.6; Windows 10's built-in d3d12.dll refuses them ("Unsupported
+        // bit-flag set"). Serialize the same signature without flags and write the flag word (the sixth dword of the
+        // 1.0 header) into the RTS0 chunk ourselves, so the layer's parser is still checked with the bits set.
+        std::puts("heap-direct flags: the host serializer refuses them (e.g. Windows 10); flag word set by hand");
+        rs_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        blob = d3d12test::serialize_root_signature(rs_desc);
+        std::size_t payload = 0;  // the serializer returns a DXBC container; its RTS0 chunk holds the signature
+        for (std::size_t at = 0; at + 8 <= blob.size() && !payload; ++at)
+            if (std::memcmp(blob.data() + at, "RTS0", 4) == 0) payload = at + 8;
+        CHECK(payload && payload + 24 <= blob.size());
+        const std::uint32_t flag_word = static_cast<std::uint32_t>(di_flags);
+        std::memcpy(blob.data() + payload + 20, &flag_word, sizeof(flag_word));
+    }
     CHECK(!blob.empty());
     Ptr<ID3D12RootSignature> root;
     CHECK(SUCCEEDED(ours.device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));
