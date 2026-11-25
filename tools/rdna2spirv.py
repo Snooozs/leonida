@@ -6574,6 +6574,26 @@ class Gen:
             return self.cu(0), self.cu(0)
         raise Unsupported(op + " source")
 
+    @staticmethod
+    def valu_imm_i64(v: int) -> int:
+        """The 64-bit value of an immediate in a signed 64-bit VALU source (v_cmp(x)_*_i64, v_ashrrev_i64 S1,
+        v_mad_i64_i32 S2). LLVM AMDGPU operand syntax, "Conversion of Integer Values": a 32-bit literal used as an
+        i64 operand is sign-extended ({-1, num.i32}), as a u64/b64 operand zero-extended ({0, num.u32}, which
+        src64_data does). llvm-mc prints -100 as 0xffffff9c, so a printed literal with bit 31 set is widened here;
+        inline constants (-16..-1) and decimal literals are parsed as negative already and pass through the mask.
+        The scalar ops do the same (SHADER-SALU-LITERAL-SEXT, #978)."""
+        v &= 0xFFFFFFFFFFFFFFFF
+        if 0x80000000 <= v <= 0xFFFFFFFF:
+            v |= 0xFFFFFFFF00000000
+        return v
+
+    def src64_i64(self, s, op):
+        """src64_data for a signed 64-bit VALU source: an immediate is widened by valu_imm_i64."""
+        if s["k"] == "imm":
+            v = self.valu_imm_i64(s["v"])
+            return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+        return self.src64_data(s, op)
+
     def dst64_data(self, d, rlo, rhi, op, *, allow_null=False):
         if allow_null and d["k"] == "special" and d.get("t") == "null":
             return
@@ -9108,12 +9128,12 @@ class Gen:
             # v_cmpx (GFX10) writes EXEC only.
             cmpx = op.startswith("v_cmpx_")
             d, x, y = (None, a[-2], a[-1]) if cmpx else (a[0], a[1], a[2])
+            cond, signed = op.split("_")[2], op.endswith("_i64")
             def pair64(sv):
                 if sv["k"] == "vgpr" and sv.get("n") == 2:
                     return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                return self.src64_data(sv, op)
+                return self.src64_i64(sv, op) if signed else self.src64_data(sv, op)
             (x0, x1), (y0, y1) = pair64(x), pair64(y)
-            cond, signed = op.split("_")[2], op.endswith("_i64")
             hi_op = {"lt": "LessThan", "le": "LessThan", "gt": "GreaterThan", "ge": "GreaterThan"}[cond]
             lo_op = {"lt": "ULessThan", "le": "ULessThanEqual", "gt": "UGreaterThan", "ge": "UGreaterThanEqual"}[cond]
             hx, hy = (self.as_int(x1), self.as_int(y1)) if signed else (x1, y1)
@@ -9168,8 +9188,9 @@ class Gen:
             if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
                 lo, hi = self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
             elif src["k"] == "imm":
-                # 64-bit inline/literal constant: sign-extended from 32 bits.
-                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                # 64-bit inline/literal constant: an inline constant is sign-extended; a 32-bit literal is
+                # sign-extended for the i64 shift and zero-extended for the b64 ones (valu_imm_i64).
+                v = self.valu_imm_i64(src["v"]) if op == "v_ashrrev_i64" else src["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu((v >> 32) & 0xFFFFFFFF)
             else:
                 raise Unsupported(op + " operands")
@@ -9909,7 +9930,7 @@ class Gen:
             def pair(s):
                 if s["k"] == "vgpr" and s.get("n") == 2:
                     return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
-                return self.src64_data(s, op)
+                return self.src64_i64(s, op) if op.endswith("_i64") else self.src64_data(s, op)
             (x0, x1), (y0, y1) = pair(x), pair(y)
             e0, e1, eq, r = (self.tmp() for _ in range(4))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
@@ -12387,7 +12408,8 @@ class Gen:
             if s2["k"] in ("vgpr", "sgpr") and s2.get("n") == 2:
                 c_lo, c_hi = self.load_reg(s2["k"], s2["r"]), self.load_reg(s2["k"], s2["r"] + 1)
             elif s2["k"] == "imm":
-                v = s2["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended from 32 bits
+                # An inline constant is sign-extended; a 32-bit literal too for the i64 S2, zero-extended for u64.
+                v = self.valu_imm_i64(s2["v"]) if signed else s2["v"] & 0xFFFFFFFFFFFFFFFF
                 c_lo, c_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " operands")

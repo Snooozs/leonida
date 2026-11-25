@@ -54,6 +54,50 @@ int check_lease(ID3D12Device* dev, ID3D12Device* xbox) {
     rt::d3d12_xs::set_descriptor_heap_allocator(nullptr, nullptr);
     return 0;
 }
+
+// With the console D16S8 family made as D24S8 (LEONIDA_CONSOLE_D16S8=d24; the default on a GPU with D24S8
+// attachments, every NVIDIA card), the depth provider has no unordered-access form of a format 118 depth-stencil
+// texture and refuses it (Resource::enable_depth_stencil_uav). Slots 76 and 133 then make it without unordered
+// access, as before the provider, so the title gets its texture instead of asserting. The description is the one
+// measured where a real boot stopped: 1280x720, one mip, the all-ones layout through slot 133.
+int check_d16s8_refused_uav(ID3D12Device* xbox) {
+    D3D12_RESOURCE_DESC tex{};
+    tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    tex.Width = 1280;
+    tex.Height = 720;
+    tex.DepthOrArraySize = tex.MipLevels = 1;
+    tex.SampleDesc.Count = 1;
+    tex.Format = static_cast<DXGI_FORMAT>(118);
+    tex.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = tex.Format;
+    clear.DepthStencil.Depth = 1;
+    using Create = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                    const D3D12_CLEAR_VALUE*, const IID*, void**);
+    Ref<ID3D12Resource> committed;
+    VERIFY(SUCCEEDED(reinterpret_cast<Create>(slot(xbox, 76))(xbox, &heap, 0, &tex, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                               &clear, &__uuidof(ID3D12Resource),
+                                                               reinterpret_cast<void**>(&committed.p))));
+    VERIFY(committed.p && committed->GetDesc().Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+
+    using Place = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*, UINT, const D3D12_CLEAR_VALUE*,
+                                   const IID*, void**);
+    constexpr SIZE_T pages = 16u << 20;  // past the texture's size on any GPU; VirtualAlloc aligns it to 64 KiB
+    void* va = VirtualAlloc(nullptr, pages, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    VERIFY(va);
+    Ref<ID3D12Resource> placed;
+    const HRESULT hr = reinterpret_cast<Place>(slot(xbox, 133))(xbox, reinterpret_cast<UINT64>(va), &tex, 0xFFFFFFFFu,
+                                                                &clear, &__uuidof(ID3D12Resource),
+                                                                reinterpret_cast<void**>(&placed.p));
+    const bool made = SUCCEEDED(hr) && placed.p && placed->GetDesc().Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    placed = {};
+    VirtualFree(va, 0, MEM_RELEASE);
+    VERIFY(made);
+    std::printf("Xbox D16S8 made as D24S8: slots 76 and 133 make the depth-stencil texture without unordered access\n");
+    return 0;
+}
 }
 
 int main() {
@@ -96,6 +140,11 @@ int main() {
     VERIFY(SUCCEEDED(rt::d3d12_xs::create_device_proxy(dev, __uuidof(ID3D12Device),
                                                        reinterpret_cast<void**>(&proxy.p), true)));
     rt::d3d12::set_device_outer(dev, proxy.p);
+    if (std::getenv("LEONIDA_TEST_D16S8_REFUSED_UAV")) {
+        VERIFY(check_d16s8_refused_uav(proxy.p) == 0);
+        VERIFY(gpu.validation_errors() == 0);
+        return 0;
+    }
     VERIFY(check_lease(dev, proxy.p) == 0);
     const auto allocation = dev->GetResourceAllocationInfo(0, 1, &tex);
     VERIFY(allocation.SizeInBytes >= 768u * 768 * layers * 2 && allocation.SizeInBytes != UINT64_MAX);

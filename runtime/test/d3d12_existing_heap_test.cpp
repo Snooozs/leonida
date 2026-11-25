@@ -1904,6 +1904,15 @@ int main() {
             failures += check_mapped_plane(ours.p);
             failures += check_mapped_bc_array(ours.p);
         }
+        {
+            // Without host image copies a title image is filled through the staged upload, a linear plane too.
+            auto no_host_copy = info;
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            failures += check_mapped_plane(staged.p);
+            failures += check_mapped_bc_array(staged.p);
+        }
         failures += check_written_pages_all(ours.p);
         {
             // A second device over the same Vulkan device: its shadows are trackers of their own.

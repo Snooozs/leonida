@@ -72,7 +72,8 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
 }
 
 // LEONIDA_PEEK="0x9e1dac0:3,0x7446510,0x98f828c" (diagnostic): a thread prints the 8-byte values at these RVAs of the
-// title's image (":n" = n consecutive values) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
+// title's image (":n" = n consecutive values, at most 32; "RVA>OFF" reads through the pointer stored at the RVA, at
+// pointer + OFF, both hex) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
 // global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly
 // that. Reads are checked; nothing is written.
 void start_title_peek(std::uint8_t* base) {
@@ -93,15 +94,35 @@ void start_title_peek(std::uint8_t* base) {
                     char* end = nullptr;
                     const std::uint64_t rva = std::strtoull(at, &end, 16);
                     if (end == at) break;
+                    // "RVA>OFF": the 8-byte pointer at the RVA, then the values at pointer + OFF (both hex).
+                    bool deref = false;
+                    std::uint64_t offset = 0;
+                    if (*end == '>') {
+                        deref = true;
+                        offset = std::strtoull(end + 1, &end, 16);
+                    }
                     unsigned count = 1;
                     if (*end == ':') count = static_cast<unsigned>(std::strtoul(end + 1, &end, 10));
-                    char text[40];
-                    std::snprintf(text, sizeof(text), " 0x%llx=", static_cast<unsigned long long>(rva));
+                    char text[48];
+                    if (deref)
+                        std::snprintf(text, sizeof(text), " 0x%llx>%llx=", static_cast<unsigned long long>(rva),
+                                      static_cast<unsigned long long>(offset));
+                    else
+                        std::snprintf(text, sizeof(text), " 0x%llx=", static_cast<unsigned long long>(rva));
                     line += text;
-                    for (unsigned i = 0; i < count && i < 16; ++i) {
+                    const std::uint8_t* from = image + rva;
+                    if (deref) {
+                        std::uint64_t pointer = 0;
+                        SIZE_T got = 0;
+                        if (!ReadProcessMemory(GetCurrentProcess(), from, &pointer, sizeof(pointer), &got) ||
+                            got != sizeof(pointer) || !pointer)
+                            count = 0, line += "?";
+                        from = reinterpret_cast<const std::uint8_t*>(pointer + offset);
+                    }
+                    for (unsigned i = 0; i < count && i < 32; ++i) {
                         std::uint64_t value = 0;
                         SIZE_T got = 0;
-                        const bool ok = ReadProcessMemory(GetCurrentProcess(), image + rva + 8ull * i, &value,
+                        const bool ok = ReadProcessMemory(GetCurrentProcess(), from + 8ull * i, &value,
                                                           sizeof(value), &got) && got == sizeof(value);
                         std::snprintf(text, sizeof(text), ok ? "%s%llx" : "%s?", i ? "," : "",
                                       static_cast<unsigned long long>(value));
@@ -127,12 +148,14 @@ void start_title_peek(std::uint8_t* base) {
 #include "mods.h"
 #include "pe_loader.h"
 #include "thread_stacks.h"
+#include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
 #ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/d3d12_compile_exit.h"
 #include "../shims/package_splash.h"
 #endif
 #include "../shims/process_shim.h"
@@ -172,7 +195,7 @@ bool configure_first_run_ui(const std::filesystem::path& package, std::filesyste
     const struct { const wchar_t* name; const wchar_t* value; } settings[] = {
         {L"LEONIDA_D3D12", L"vulkan"}, {L"LEONIDA_ARENA_MB", L"2048"},
         {L"LEONIDA_GRAPHICS_STAGE_LAYOUT", L"1"}, {L"LEONIDA_PIPELINE_COMPILE", L"on-demand"},
-        {L"LEONIDA_GPU_LABELS", L"1"}, {L"LEONIDA_FRAME_PACING", L"1"},
+        {L"LEONIDA_FRAME_PACING", L"1"},
         {L"LEONIDA_KEYBOARD_PAD", L"always"},
     };
     for (const auto& setting : settings) {
@@ -205,6 +228,18 @@ int usage() {
 }  // namespace
 
 #ifdef LEONIDA_VULKAN_DEVICE
+// The run ends with the title's Vulkan device alive, so no ~Device stops the background pipeline compiler: stop it
+// here, before ExitProcess ends its thread, maybe inside the driver's compiler (rt::d3d12::stop_pipeline_compiles).
+constexpr unsigned kExitCompileWaitMs = 2000;  // a console close gives the whole process 5 s
+
+static BOOL WINAPI stop_compiles_on_console_exit(DWORD event) {
+    if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT || event == CTRL_CLOSE_EVENT) {
+        rt::d3d12_xs::stop_list_values(500);  // as at the run's end: no list-value thread cut off inside the layer
+        rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+    }
+    return FALSE;  // the next handler (the default one: ExitProcess) ends the process, as before
+}
+
 static BOOL WINAPI show_package_window(HWND window, int command) {
     const BOOL previous = ShowWindow(window, command);
     const DWORD error = GetLastError();
@@ -357,6 +392,7 @@ int wmain(int argc, wchar_t** argv) {
     leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases);
     leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);
     rt::d3d12_xs::set_texture_page_provider(&rt::xmem::pin_mapped_data);
+    leonida::kernel_writes::set_unguarder(&rt::xmem::reopen_unowned);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
@@ -477,6 +513,10 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
         start_title_peek(main_module.base);
+        leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
+#ifdef LEONIDA_VULKAN_DEVICE
+        SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
+#endif
         int code;
         {
             auto stacks = rt::start_thread_stacks();
@@ -491,6 +531,12 @@ int wmain(int argc, wchar_t** argv) {
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
         // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
+        // The list-value threads end first: ExitProcess must not cut one off inside the layer (in a held submission,
+        // holding its queues' lock).
+        rt::d3d12_xs::stop_list_values(500);
+#ifdef LEONIDA_VULKAN_DEVICE
+        rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+#endif
         rt::cleanup_tls_clones();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {

@@ -16,6 +16,7 @@
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xmem.h"
+#include "../src/title_page_watch.h"
 #include "../src/d3d12_xs_frame_events.h"
 #include "../src/native_pso.h"
 
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -102,6 +104,7 @@ struct Mock {
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool full_chain_lists;   // device: CreateCommandList makes a full-chain list mock (Kind::list), else command_list
     bool create_null;        // device: creation returns create_result with no object
+    bool zero_fences;        // device: the fences it makes start at 0, not kCompletedValue
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     bool list_refuse;        // device: CreateCommandList refuses every riid with E_NOINTERFACE
     IID create_riid;         // device: copy of the riid its last CreateCommandList got (the caller's may be a local)
@@ -111,6 +114,9 @@ struct Mock {
     std::uint64_t completed; // fence: what GetCompletedValue (slot 8) returns
     std::uint64_t armed_value;  // fence: the value SetEventOnCompletion (slot 9) waits for
     HANDLE armed_event;      // fence: the event it sets then, or null
+    Mock* completes_with;    // fence: once its completed value reaches completes_at, a GetCompletedValue first
+    std::uint64_t completes_at, completes_value;  // signals that fence to completes_value (GPU order across queues)
+    bool signals_complete;   // queue: a Signal (slot 14) completes the fence at once, as an idle GPU would
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -133,7 +139,7 @@ struct Mock {
     D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
 };
 
-Mock g_pool[256];
+Mock g_pool[512];
 unsigned g_pool_used = 0;
 
 void** mock_vtable();
@@ -217,7 +223,8 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
-        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
+        case Kind::heap:  // a descriptor heap, or a query heap (device slot 39)
+            return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap)) || IsEqualIID(iid, __uuidof(ID3D12QueryHeap));
         case Kind::command_list:
             if (IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
                 IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList))) return true;
@@ -271,6 +278,7 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
     child->allocator_tag = device->allocator_tag;
+    if (kind == Kind::fence && device->zero_fences) child->completed = 0;
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
@@ -278,6 +286,35 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
 void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t count) {
     const auto* in = reinterpret_cast<const std::uint64_t*>(objects);
     for (std::uint32_t i = 0; in && i < static_cast<std::uint32_t>(count) && i < 4; ++i) m->array[slot][i] = in[i];
+}
+
+// The mock GPU clock pairs kMockGpu0 with a fixed QPC origin. Its timestamp frequency is 1 MHz. A resource's Map (slot 8) hands out
+// g_mock_mapped: the timestamp readback of list values, which the test fills as the GPU would.
+constexpr std::uint64_t kMockGpu0 = 1000000;
+// All mock queues use the same fixed clock pair, even when the pump recalibrates one queue.
+std::uint64_t mock_cpu_origin() {
+    static const auto origin = [] {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return static_cast<std::uint64_t>(now.QuadPart);
+    }();
+    return origin;
+}
+alignas(8) std::uint64_t g_mock_readback[4096];
+void* g_mock_mapped = g_mock_readback;
+
+// The queue calls that order work (ExecuteCommandLists 10, Signal 14, Wait 15), in the order the mock queues got
+// them: for an ExecuteCommandLists, a1 is the count and a2 the first list; else the fence and the value.
+struct QueueCall {
+    const Mock* queue;
+    unsigned slot;
+    std::uint64_t a1, a2;
+};
+QueueCall g_queue_calls[64];
+unsigned g_queue_call_count = 0;
+
+void log_queue_call(const Mock* queue, unsigned slot, std::uint64_t a1, std::uint64_t a2) {
+    if (g_queue_call_count < std::size(g_queue_calls)) g_queue_calls[g_queue_call_count++] = {queue, slot, a1, a2};
 }
 
 // GetResourceAllocationInfo as a PC driver without console tile padding answers it. A buffer is its width, a texture
@@ -358,6 +395,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 break;
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
+            case 39: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));    // CreateQueryHeap
             case 32:                                                                          // OpenSharedHandle
                 if (a1 == kFenceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a2, a3));
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
@@ -426,13 +464,24 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     }
     if (m->kind == Kind::fence) {
         switch (slot) {
-            case 8: return fence_completed(m);  // GetCompletedValue
+            case 8:  // GetCompletedValue
+                if (m->completes_with && fence_completed(m) >= m->completes_at) {
+                    fence_signal(m->completes_with, m->completes_value);
+                    m->completes_with = nullptr;
+                }
+                return fence_completed(m);
             case 9: return static_cast<std::uint32_t>(fence_set_event(m, a1, reinterpret_cast<HANDLE>(a2)));
             case 10: fence_signal(m, a1); return S_OK;  // Signal
             default: break;
         }
     }
-    if (m->kind == Kind::queue && slot == 10) copy_array(m, 10, a2, a1);  // ExecuteCommandLists(count, lists)
+    if (m->kind == Kind::queue && slot == 10) {  // ExecuteCommandLists(count, lists)
+        copy_array(m, 10, a2, a1);
+        log_queue_call(m, 10, static_cast<std::uint32_t>(a1), a2 ? *reinterpret_cast<const std::uint64_t*>(a2) : 0);
+    }
+    if (m->kind == Kind::queue && (slot == 14 || slot == 15)) log_queue_call(m, slot, a1, a2);  // Signal, Wait
+    if (m->kind == Kind::queue && slot == 14 && m->signals_complete && a1)
+        fence_signal(reinterpret_cast<Mock*>(a1), a2);
     if ((m->kind == Kind::command_list || m->kind == Kind::list) && slot == 28)
         copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
     if (m->kind == Kind::queue && slot == 16 && a1) {
@@ -442,6 +491,13 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         const auto base = reinterpret_cast<std::uintptr_t>(g_pool);
         const bool is_mock = at >= base && at < base + sizeof(g_pool) && (at - base) % sizeof(Mock) == 0;
         if (!is_mock) *reinterpret_cast<UINT64*>(a1) = 1000000;
+    }
+    if (m->kind == Kind::queue && slot == 17 && a1 && a2) {
+        *reinterpret_cast<UINT64*>(a1) = kMockGpu0;
+        *reinterpret_cast<UINT64*>(a2) = mock_cpu_origin();
+    }
+    if (m->kind == Kind::resource && slot == 8 && a3) {  // Map(subresource, range, data): the test's readback
+        *reinterpret_cast<void**>(a3) = g_mock_mapped;
     }
     if (m->kind == Kind::heap && slot == 9) {
         if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
@@ -1544,6 +1600,126 @@ int check_placed_resource_x() {
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, COMMON for all-ones, "
                 "clear value for targets only), past a 76-slot device\n", g_label);
+    return 0;
+}
+
+// ---- 6c. Slots 76 and 133 when the depth provider refuses a depth-stencil texture with unordered access ----
+//
+// The provider answers E_INVALIDARG or E_NOTIMPL for a texture it has no unordered-access form of: a console D16S8
+// (format 118) target that the Vulkan layer makes as D24S8 on a GPU with D24S8 attachments (NVIDIA). The slots then
+// make the texture as they did before the provider: slot 76 a committed texture without unordered access, slot 133
+// its stand-in (the title-pages handler, else the committed one). The backing the provider refused is released. Any
+// other failure (the provider out of memory, the backing itself, a placement the backend refuses) is passed on as it
+// is, with no stand-in.
+HRESULT g_provider_result = S_OK;
+unsigned g_provider_calls = 0;
+Mock* g_provider_backing = nullptr;  // the resource the provider was last given
+bool g_placement_valid = true;
+
+HRESULT mock_depth_provider(ID3D12Resource* resource, D3D12_HEAP_FLAGS) {
+    ++g_provider_calls;
+    g_provider_backing = reinterpret_cast<Mock*>(resource);
+    return g_provider_result;
+}
+
+bool mock_validate_placement(const D3D12_RESOURCE_DESC&, std::uint32_t, const D3D12_CLEAR_VALUE*) {
+    return g_placement_valid;
+}
+
+int check_depth_provider_refusal() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::set_depth_stencil_uav_provider(device, mock_depth_provider, mock_validate_placement));
+    constexpr std::uint64_t kVa = 0x7f0000000000ull;  // 64 KiB aligned, as the placement is checked to be
+    constexpr auto kDepthStencilUav = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // The description measured where a real boot stopped: 1280x720, one mip, format 118, depth-stencil with UAV.
+    D3D12_RESOURCE_DESC d16s8{};
+    d16s8.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d16s8.Width = 1280;
+    d16s8.Height = 720;
+    d16s8.DepthOrArraySize = 1;
+    d16s8.MipLevels = 1;
+    d16s8.Format = static_cast<DXGI_FORMAT>(118);
+    d16s8.SampleDesc.Count = 1;
+    d16s8.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    d16s8.Flags = kDepthStencilUav;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    void* resource = nullptr;
+    const std::uint64_t words76[10] = {word(&heap), 0, word(&d16s8), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0,
+                                       word(&kResourceIid), word(&resource), 0, 0, 0};
+    const auto place = [&] {
+        return hr_of(raw6(device, 133, kVa, word(&d16s8), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource)));
+    };
+    const auto arm = [&](HRESULT result) {
+        g_provider_result = result;
+        g_provider_calls = 0;
+        g_provider_backing = nullptr;
+        resource = reinterpret_cast<void*>(1);
+        return mock->calls[27];
+    };
+
+    // The provider accepts: one backing, handed out as the texture (slot 76) or behind its placement (slot 133).
+    unsigned before = arm(S_OK);
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource == g_provider_backing && g_provider_calls == 1);
+    EXPECT(mock->calls[27] == before + 1 && !(g_committed.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    EXPECT(release(resource) == 0);
+    before = arm(S_OK);
+    EXPECT(place() == S_OK && resource && g_provider_calls == 1 && mock->calls[27] == before + 1);
+    EXPECT(release(resource) == 0 && g_provider_backing->refs == 0);
+
+    // The provider refuses: the texture is made without it, and the refused backing is not kept.
+    for (const HRESULT refusal : {E_INVALIDARG, E_NOTIMPL}) {
+        before = arm(refusal);
+        EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource && g_provider_calls == 1);
+        EXPECT(g_provider_backing && g_provider_backing->refs == 0 && resource != g_provider_backing);
+        EXPECT(mock->calls[27] == before + 2 && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+        EXPECT(g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL &&
+               g_committed.desc.Format == d16s8.Format && g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(g_committed.state == D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        EXPECT(release(resource) == 0);
+
+        // Slot 133 reaches its stand-in with the title's description, as before the provider; without the
+        // title-pages handler that is the committed DEFAULT one, in COMMON for the all-ones layout.
+        before = arm(refusal);
+        EXPECT(place() == S_OK && resource && g_provider_calls == 1);
+        EXPECT(g_provider_backing && g_provider_backing->refs == 0 && resource != g_provider_backing);
+        EXPECT(mock->calls[27] == before + 2 && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+        EXPECT(g_committed.heap.Type == D3D12_HEAP_TYPE_DEFAULT && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+        EXPECT(g_committed.desc.Format == d16s8.Format && g_committed.desc.Width == d16s8.Width &&
+               g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(release(resource) == 0);
+    }
+
+    // Any other failure of the provider is passed on, with no texture and no stand-in.
+    before = arm(E_OUTOFMEMORY);
+    EXPECT(hr_of(raw10(device, 76, words76)) == E_OUTOFMEMORY && !resource && g_provider_calls == 1);
+    EXPECT(g_provider_backing->refs == 0 && mock->calls[27] == before + 1);
+    before = arm(E_OUTOFMEMORY);
+    EXPECT(place() == E_OUTOFMEMORY && !resource && g_provider_calls == 1);
+    EXPECT(g_provider_backing->refs == 0 && mock->calls[27] == before + 1);
+
+    // So is a failure of the backing itself, which the provider never sees.
+    mock->create_result = E_INVALIDARG;
+    before = arm(S_OK);
+    EXPECT(hr_of(raw10(device, 76, words76)) == E_INVALIDARG && !resource && g_provider_calls == 0);
+    EXPECT(mock->calls[27] == before + 1);
+    before = arm(S_OK);
+    EXPECT(place() == E_INVALIDARG && !resource && g_provider_calls == 0 && mock->calls[27] == before + 1);
+    mock->create_result = S_OK;
+
+    // And a placement the backend refuses (E_INVALIDARG too), before any backing is made.
+    g_placement_valid = false;
+    before = arm(E_INVALIDARG);
+    EXPECT(place() == E_INVALIDARG && !resource && g_provider_calls == 0 && mock->calls[27] == before);
+    g_placement_valid = true;
+
+    EXPECT(xs::set_depth_stencil_uav_provider(device, nullptr));
+    g_provider_result = S_OK;
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a format 118 depth-stencil texture the depth provider refuses (E_INVALIDARG, E_NOTIMPL) is made "
+                "without it by slots 76 and 133; its other failures, the backing's and the placement's are passed "
+                "on\n", g_label);
     return 0;
 }
 
@@ -3718,6 +3894,711 @@ int check_committed_resource3_x() {
 
 }  // namespace
 
+// ---- 14. List memory writes and waits (list slots 71-74 on the newer layout, d3d12_xs_list_values.h) ----------
+// Synthetic title memory, the mock queues' ordered calls and the mock fences stand in for the GPU: a write lands
+// only once the queue's write fence is reached, a wait holds its part behind a gate fence the pump signals, a write
+// in flight is relayed as a queue Wait on its fence, and a list is cut at a wait recorded after work.
+
+alignas(64) std::uint64_t g_cells[8];
+
+std::uint64_t cell(int i) { return *reinterpret_cast<volatile std::uint64_t*>(&g_cells[i]); }
+
+bool queue_call_is(unsigned i, const Mock* queue, unsigned slot, std::uint64_t a1, std::uint64_t a2) {
+    return i < g_queue_call_count && g_queue_calls[i].queue == queue && g_queue_calls[i].slot == slot &&
+           g_queue_calls[i].a1 == a1 && g_queue_calls[i].a2 == a2;
+}
+
+void* make_console_list(void* device, void* allocator, Mock* device_mock, Mock** real) {
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* list = nullptr;
+    if (FAILED(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                         word(&list)))))
+        return nullptr;
+    *real = device_mock->last_child;
+    return list;
+}
+
+std::uint64_t submit(void* queue, void* list) {
+    void* lists[1] = {list};
+    return raw(queue, 35, 1, word(lists));
+}
+
+int check_list_values() {
+    // The slot decode: newer layout (and an undetected one) 71-74, older 69-72.
+    static_assert(xs::console_value_op(71, 0) == xs::ConsoleValueOp::write32);
+    static_assert(xs::console_value_op(72, xs::kConsoleLayoutNewer) == xs::ConsoleValueOp::write64);
+    static_assert(xs::console_value_op(73, 0) == xs::ConsoleValueOp::wait32);
+    static_assert(xs::console_value_op(74, 0) == xs::ConsoleValueOp::wait64);
+    static_assert(xs::console_value_op(70, 0) == xs::ConsoleValueOp::none);  // depth bounds on the newer layout
+    static_assert(xs::console_value_op(75, 0) == xs::ConsoleValueOp::none);
+    static_assert(xs::console_value_op(69, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::write32);
+    static_assert(xs::console_value_op(72, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::wait64);
+    static_assert(xs::console_value_op(73, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::none);
+    // Comparison codes: memory OP reference, D3D12_COMPARISON_FUNC order.
+    EXPECT(xs::console_value_met(2, 4, 5, true) && !xs::console_value_met(2, 5, 5, true));
+    EXPECT(xs::console_value_met(3, 5, 5, true) && !xs::console_value_met(3, 6, 5, true));
+    EXPECT(xs::console_value_met(4, 5, 5, true) && !xs::console_value_met(4, 6, 5, true));
+    EXPECT(xs::console_value_met(5, 6, 5, true) && !xs::console_value_met(5, 5, 5, true));
+    EXPECT(xs::console_value_met(6, 6, 5, true) && !xs::console_value_met(6, 5, 5, true));
+    EXPECT(xs::console_value_met(7, 5, 5, true) && !xs::console_value_met(7, 4, 5, true));
+    // A 32-bit wait compares the low halves only; always, never and unknown codes count as met.
+    EXPECT(xs::console_value_met(3, 0xffffffff00000005ull, 5, false) &&
+           !xs::console_value_met(3, 0xffffffff00000005ull, 5, true));
+    EXPECT(xs::console_value_met(7, 0x100000000ull, 1, true) && !xs::console_value_met(7, 0x100000000ull, 1, false));
+    EXPECT(xs::console_value_met(1, 0, 1, true) && xs::console_value_met(8, 0, 1, true) &&
+           xs::console_value_met(0, 0, 1, true) && xs::console_value_met(9, 0, 1, true));
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);  // full-chain list mocks
+    EXPECT(device);
+    mock->zero_fences = true;  // the gate and write fences start at 0: nothing is reached before the test says so
+    xs::reset_list_value_stats();
+    xs::set_list_value_wait_timeout_ms(5000);
+    void* qa = make_queue(device);
+    void* qb = make_queue(device);
+    EXPECT(qa && qb);
+    Mock* const qa_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qa));
+    Mock* const qb_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qb));
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const real_allocator = mock->last_child;
+    Mock* lw_real = nullptr;
+    Mock* lv_real = nullptr;
+    void* lw = make_console_list(device, allocator, mock, &lw_real);  // writes, on queue A
+    EXPECT(lw && xs::list_proxy_part_count(lw) == 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);  // closed, so the waiter's list can record into the same allocator
+    void* lv = make_console_list(device, allocator, mock, &lv_real);  // waits, on queue B
+    EXPECT(lv);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    std::memset(g_cells, 0, sizeof(g_cells));
+
+    // 1. Writes land after the work before them: not at submission, once the queue's write fence is reached.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);                                  // Dispatch
+    raw(lw, 72, word(&g_cells[0]), 0x1374, 0, 0);         // write64(address, value, flush, flags)
+    raw(lw, 71, word(&g_cells[1]), 0x10000abcdull, 0, 0);  // write32: the low 32 bits
+    raw(lw, 72, word(&g_cells[2]), 0, 0, 1);              // write64 flag 1: a GPU timestamp
+    EXPECT(hr_of(raw(lw, 9)) == S_OK && xs::list_proxy_part_count(lw) == 1);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    Mock* const a_written = mock->last_child;  // QueueValues::create made the gate, then the write fence
+    Mock* const a_gate = a_written - 1;
+    EXPECT(a_written->kind == Kind::fence && a_gate->kind == Kind::fence);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qa_mock, 10, 1, word(lw_real)) &&
+           queue_call_is(1, qa_mock, 14, word(a_written), 1));
+    EXPECT(!xs::list_values_idle(30) && cell(0) == 0 && cell(1) == 0 && cell(2) == 0);
+    fence_signal(a_written, 1);
+    EXPECT(xs::list_values_idle(2000));
+    EXPECT(cell(0) == 0x1374 && cell(1) == 0xabcd && cell(2) != 0);
+    xs::ListValueStats stats = xs::list_value_stats();
+    EXPECT(stats.writes_recorded == 3 && stats.writes_landed == 3 && stats.writes_failed == 0);
+
+    // 2. A wait holds its part until another queue's write lands: the waiter's queue waits on its gate before the
+    // part, and the pump signals the gate only after the writer's fence is reached and the value is in memory.
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[3]), 7, 5, 1);  // wait64(address, >=, 5, ?), before any work: the part's gate
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK && xs::list_proxy_part_count(lv) == 1);
+    g_queue_call_count = 0;
+    EXPECT(submit(qb, lv) == 0);
+    Mock* const b_written = mock->last_child;
+    Mock* const b_gate = b_written - 1;
+    EXPECT(b_written->kind == Kind::fence && b_gate->kind == Kind::fence && b_gate != a_gate);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qb_mock, 15, word(b_gate), 1) &&
+           queue_call_is(1, qb_mock, 10, 1, word(lv_real)));
+    EXPECT(!xs::list_values_idle(30) && fence_completed(b_gate) == 0);
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[3]), 5, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(!xs::list_values_idle(30) && fence_completed(b_gate) == 0 && cell(3) == 0);  // the writer has not run
+    fence_signal(a_written, 2);
+    EXPECT(xs::list_values_idle(2000) && cell(3) == 5 && fence_completed(b_gate) == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.waits_recorded == 1 && stats.gates_held == 1 && stats.gates_met == 1 && stats.gates_timed_out == 0);
+
+    // 3. A wait a write in flight will meet is relayed: the waiter's queue waits on the writer's fence value.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[4]), 9, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    EXPECT(submit(qa, lw) == 0);  // a_written 3, not reached
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[4]), 7, 9, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qb_mock, 15, word(a_written), 3) &&
+           queue_call_is(1, qb_mock, 10, 1, word(lv_real)));
+    stats = xs::list_value_stats();
+    EXPECT(stats.waits_relayed == 1 && stats.gates_held == 1);
+    fence_signal(a_written, 3);
+    EXPECT(xs::list_values_idle(2000) && cell(4) == 9);
+
+    // 4. A met wait costs nothing (a 32-bit one ignores the high half of memory); an unmet one that nothing meets
+    // is bounded: the gate opens after the timeout.
+    g_cells[5] = 0xffffffff00000077ull;
+    xs::set_list_value_wait_timeout_ms(30);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 73, word(&g_cells[5]), 3, 0x77, 1);  // wait32(address, ==, 0x77): met now
+    raw(lv, 73, word(&g_cells[6]), 3, 0x77, 1);  // never written
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    g_queue_call_count = 0;
+    const ULONGLONG started = GetTickCount64();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qb_mock, 15, word(b_gate), 2));
+    EXPECT(xs::list_values_idle(3000) && fence_completed(b_gate) == 2 && GetTickCount64() - started >= 20);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_timed_out == 1 && stats.waits_met_at_submit >= 1);
+    xs::set_list_value_wait_timeout_ms(5000);
+
+    // 5. Memory the title's CPU writes opens a gate too (the pump looks at it while a gate is held).
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[7]), 5, 0, 1);  // wait64(address, >, 0)
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(!xs::list_values_idle(30) && fence_completed(b_gate) == 2);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[7]), 1);
+    EXPECT(xs::list_values_idle(2000) && fence_completed(b_gate) == 3);
+
+    // 6. A wait after work cuts the list: the part so far closes, recording goes on in a spare list that starts
+    // with the state the title set, and the queue runs the first part, stands at the wait, then runs the second.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    const unsigned primary_closes = lw_real->calls[9], primary_dispatches = lw_real->calls[14];
+    raw(lw, 25, 0x1234);         // SetPipelineState -> PC 25
+    raw(lw, 33, 0x5678);         // SetComputeRootSignature -> PC 29
+    raw(lw, 35, 2, 0x9000);      // SetComputeRootDescriptorTable(2, handle) -> PC 31
+    raw(lw, 37, 1, 0x42, 3);     // SetComputeRoot32BitConstant(1, value, offset 3) -> PC 33
+    const D3D12_VIEWPORT viewport{0, 0, 640, 480, 0, 1};
+    raw(lw, 21, 1, word(&viewport));  // RSSetViewports -> PC 21
+    raw(lw, 14, 1, 1, 1);
+    const unsigned creates = mock->calls[12];
+    g_cells[6] = 0;
+    raw(lw, 74, word(&g_cells[6]), 7, 1, 1);  // after work: a cut
+    EXPECT(xs::list_proxy_part_count(lw) == 2 && xs::list_value_stats().cuts == 1 && mock->calls[12] == creates + 1);
+    Mock* const spare = mock->last_child;
+    EXPECT(spare->kind == Kind::list && mock->args[12][2] == word(real_allocator));
+    EXPECT(lw_real->calls[9] == primary_closes + 1);  // the first part was closed at the cut
+    EXPECT(spare->calls[25] == 1 && spare->args[25][0] == 0x1234);
+    EXPECT(spare->calls[29] == 1 && spare->args[29][0] == 0x5678);
+    EXPECT(spare->calls[31] == 1 && spare->args[31][0] == 2 && spare->args[31][1] == 0x9000);
+    EXPECT(spare->calls[33] == 1 && spare->args[33][0] == 1 && spare->args[33][1] == 0x42 && spare->args[33][2] == 3);
+    EXPECT(spare->calls[21] == 1 && spare->args[21][0] == 1);
+    raw(lw, 14, 2, 2, 2);  // after the wait: the spare records it
+    EXPECT(spare->calls[14] == 1 && lw_real->calls[14] == primary_dispatches + 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK && spare->calls[9] == 1);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(g_queue_call_count == 3 && queue_call_is(0, qa_mock, 10, 1, word(lw_real)) &&
+           queue_call_is(1, qa_mock, 15, word(a_gate), 1) && queue_call_is(2, qa_mock, 10, 1, word(spare)));
+    EXPECT(!xs::list_values_idle(30) && fence_completed(a_gate) == 0);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[6]), 1);
+    EXPECT(xs::list_values_idle(2000) && fence_completed(a_gate) == 1);
+    // The next recording starts on the primary list again; a later cut reuses the spare (Reset, no new list), and a
+    // met wait between the parts puts both in one submission.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK && xs::list_proxy_part_count(lw) == 1);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 74, word(&g_cells[6]), 7, 1, 1);
+    EXPECT(xs::list_proxy_part_count(lw) == 2 && mock->calls[12] == creates + 1 && spare->calls[10] == 1);
+    raw(lw, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(g_queue_call_count == 1 && queue_call_is(0, qa_mock, 10, 2, word(lw_real)) &&
+           qa_mock->array[10][1] == word(spare));
+
+    // 7. A query open across a wait defers the cut to its EndQuery: a list must end the queries it begins.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 56, 0x1111, D3D12_QUERY_TYPE_OCCLUSION, 0);  // BeginQuery -> PC 52
+    raw(lw, 12, 3, 1, 0, 0);                              // DrawInstanced
+    raw(lw, 74, word(&g_cells[6]), 7, 1, 1);
+    EXPECT(xs::list_proxy_part_count(lw) == 1 && xs::list_value_stats().cuts_deferred == 1);
+    raw(lw, 57, 0x1111, D3D12_QUERY_TYPE_OCCLUSION, 0);  // EndQuery -> PC 53: the cut happens here
+    EXPECT(xs::list_proxy_part_count(lw) == 2);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    EXPECT(xs::list_value_stats().cut_failures == 0);
+
+    // 8. Writes before a part's first wait (no work yet) land before the queue stands at it, without a cut: the
+    // title's direct lists write job tags as their first calls and then wait for compute results whose lists wait
+    // for those tags; a gate ahead of the writes would hold both queues until the timeout.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 72, word(&g_cells[3]), 0x55, 0, 0);  // write64 first
+    raw(lw, 74, word(&g_cells[7]), 7, 2, 1);     // then a wait (memory holds 1)
+    raw(lw, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK && xs::list_proxy_part_count(lw) == 1);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(g_queue_call_count == 3 && queue_call_is(0, qa_mock, 14, word(a_written), 4) &&
+           queue_call_is(1, qa_mock, 15, word(a_gate), 2) && queue_call_is(2, qa_mock, 10, 1, word(lw_real)));
+    fence_signal(a_written, 4);
+    EXPECT(!xs::list_values_idle(30) && cell(3) == 0x55 && fence_completed(a_gate) == 1);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[7]), 2);
+    EXPECT(xs::list_values_idle(2000) && fence_completed(a_gate) == 2);
+    // A write between two waits cuts the list (it must not land before the first wait is passed); with the first
+    // wait met, the first part's pre-write and write land behind it, before the queue stands at the second wait.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 72, word(&g_cells[3]), 0x66, 0, 0);
+    raw(lw, 74, word(&g_cells[7]), 7, 2, 1);  // met
+    raw(lw, 72, word(&g_cells[4]), 0x77, 0, 0);
+    raw(lw, 74, word(&g_cells[7]), 7, 3, 1);  // unmet: a cut
+    EXPECT(xs::list_proxy_part_count(lw) == 2 && mock->calls[12] == creates + 1);
+    raw(lw, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(g_queue_call_count == 4 && queue_call_is(0, qa_mock, 10, 1, word(lw_real)) &&
+           queue_call_is(1, qa_mock, 14, word(a_written), 5) && queue_call_is(2, qa_mock, 15, word(a_gate), 3) &&
+           queue_call_is(3, qa_mock, 10, 1, word(spare)));
+    fence_signal(a_written, 5);
+    EXPECT(!xs::list_values_idle(30) && cell(3) == 0x66 && cell(4) == 0x77 && fence_completed(a_gate) == 2);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[7]), 3);
+    EXPECT(xs::list_values_idle(2000) && fence_completed(a_gate) == 3);
+
+    // Every real list, spare and fence goes with its proxy.
+    EXPECT(xs::list_values_idle(2000));
+    EXPECT(release(lw) == 0 && lw_real->refs == 0 && spare->refs == 0);
+    EXPECT(release(lv) == 0 && lv_real->refs == 0);
+    EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+    EXPECT(release(qa) == 0 && release(qb) == 0 && qa_mock->refs == 0 && qb_mock->refs == 0);
+    EXPECT(a_gate->refs == 0 && a_written->refs == 0 && b_gate->refs == 0 && b_written->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: list memory writes land after their part, waits hold their part behind a gate (relayed onto a "
+                "write in flight, bounded by a timeout), and a wait after work cuts the list with its state replayed\n",
+                g_label);
+    return 0;
+}
+
+// ---- 15. List values, the rest: LEONIDA_LIST_VALUES=0, bundles, ClearState, root constants, landing order across
+// queues, the short timeout for every wait, CopyPageMappingsBatchX behind held work, value stores, the exit ----
+
+alignas(64) std::uint64_t g_cells2[32];
+
+std::uint64_t cell2(int i) { return *reinterpret_cast<volatile std::uint64_t*>(&g_cells2[i]); }
+
+struct Tear {
+    alignas(8) std::uint64_t cell = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned> torn{0}, reads{0};
+};
+Tear g_tear;
+
+// A CPU job of the title's: writes the label a GPU wait is waiting for, 100 ms after it was started.
+DWORD WINAPI label_job(LPVOID cell) {
+    Sleep(100);
+    InterlockedExchange64(static_cast<volatile LONG64*>(cell), 1);
+    return 0;
+}
+
+// The value of the queue's first logged Signal (slot 14) on `fence` since g_queue_call_count was reset, or 0.
+std::uint64_t logged_signal(const Mock* queue, const Mock* fence) {
+    for (unsigned i = 0; i < g_queue_call_count; ++i)
+        if (g_queue_calls[i].queue == queue && g_queue_calls[i].slot == 14 && g_queue_calls[i].a1 == word(fence))
+            return g_queue_calls[i].a2;
+    return 0;
+}
+
+DWORD WINAPI tear_reader(LPVOID) {
+    while (!g_tear.stop.load(std::memory_order_relaxed)) {
+        const std::uint64_t v = *reinterpret_cast<volatile std::uint64_t*>(&g_tear.cell);
+        if (v != 0 && v != ~0ull) g_tear.torn.fetch_add(1, std::memory_order_relaxed);
+        g_tear.reads.fetch_add(1, std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+// Queue slot 31 (CopyPageMappingsBatchX) as the list-values tests see it: the hook records the last call and the
+// first batch, so a test can tell a remap of the proxy's copy (deferred behind queue work) from the caller's array.
+struct PageMappingRecord {
+    int count = 0;
+    const rt::xmem::PageBatch* batches = nullptr;
+    std::uintptr_t pool = 0;
+    std::uint32_t pages = 0, flags = 0;
+    std::uintptr_t first_destination = 0;
+    std::uint32_t first_count = 0;
+    rt::xmem::PageRange first_ranges[4]{};
+};
+static PageMappingRecord g_page_mapping;
+
+static bool record_page_mapping(std::uint32_t count, const rt::xmem::PageBatch* batches, std::uintptr_t pool,
+                                std::uint32_t pages, std::uint32_t flags) {
+    ++g_page_mapping.count;
+    g_page_mapping.batches = batches;
+    g_page_mapping.pool = pool;
+    g_page_mapping.pages = pages;
+    g_page_mapping.flags = flags;
+    if (count && batches) {
+        g_page_mapping.first_destination = batches[0].destination;
+        g_page_mapping.first_count = batches[0].count;
+        for (std::uint32_t i = 0; i < batches[0].count && i < 4 && batches[0].ranges; ++i)
+            g_page_mapping.first_ranges[i] = batches[0].ranges[i];
+    }
+    return true;
+}
+
+int check_list_values_more() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    mock->zero_fences = true;
+    xs::reset_list_value_stats();
+    xs::set_list_value_wait_timeout_ms(5000);
+    void* qa = make_queue(device);
+    void* qb = make_queue(device);
+    void* qc = make_queue(device);
+    EXPECT(qa && qb && qc);
+    Mock* const qa_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qa));
+    Mock* const qb_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qb));
+    Mock* const qc_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qc));
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    std::memset(g_cells2, 0, sizeof(g_cells2));
+
+    // 1. LEONIDA_LIST_VALUES=0 (for the lists made meanwhile): writes and waits are the no-ops they were, nothing is
+    // cut, and the submission is the plain one.
+    xs::set_list_values_enabled(false);
+    Mock* off_real = nullptr;
+    void* off = make_console_list(device, allocator, mock, &off_real);
+    EXPECT(off && hr_of(raw(off, 9)) == S_OK);
+    xs::set_list_values_enabled(true);
+    EXPECT(hr_of(raw(off, 139, word(allocator), 0)) == S_OK);
+    raw(off, 25, 0x1234);
+    raw(off, 14, 1, 1, 1);
+    raw(off, 74, word(&g_cells2[0]), 7, 1, 1);  // unmet, after work: a modelled list would be cut here
+    raw(off, 72, word(&g_cells2[1]), 5, 0, 0);
+    EXPECT(hr_of(raw(off, 9)) == S_OK && xs::list_proxy_part_count(off) == 1);
+    xs::ListValueStats stats = xs::list_value_stats();
+    EXPECT(stats.waits_recorded == 0 && stats.writes_recorded == 0 && stats.cuts == 0);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, off) == 0);
+    EXPECT(g_queue_call_count == 1 && queue_call_is(0, qa_mock, 10, 1, word(off_real)));
+    EXPECT(xs::list_values_idle(2000) && cell2(1) == 0);
+
+    // 2. A bundle's writes and waits are no-ops too (a cut bundle would lose its first parts: ExecuteBundle names
+    // one real list), but what it sets stays set in the list that executes it, and a cut there replays it.
+    void* bundle = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, word(allocator), 0, word(&gcl_iid),
+                     word(&bundle))) == S_OK);
+    Mock* const bundle_real = mock->last_child;
+    raw(bundle, 25, 0xB0B);       // SetPipelineState
+    raw(bundle, 33, 0x5678);      // SetComputeRootSignature: the executing list's, whose arguments stay
+    raw(bundle, 37, 1, 0x99, 0);  // SetComputeRoot32BitConstant(1, 0x99, offset 0)
+    raw(bundle, 14, 1, 1, 1);
+    raw(bundle, 74, word(&g_cells2[0]), 7, 1, 1);
+    raw(bundle, 72, word(&g_cells2[1]), 5, 0, 0);
+    EXPECT(hr_of(raw(bundle, 9)) == S_OK && xs::list_proxy_part_count(bundle) == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.bundle_ops == 2 && stats.waits_recorded == 0 && stats.writes_recorded == 0 && stats.cuts == 0);
+    Mock* direct_real = nullptr;
+    void* direct = make_console_list(device, allocator, mock, &direct_real);
+    EXPECT(direct && hr_of(raw(direct, 9)) == S_OK);
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 33, 0x5678);
+    raw(direct, 35, 2, 0x9000);  // a table the bundle leaves alone
+    const std::uint32_t constants[3] = {0xc1, 0xc2, 0xc3};
+    raw(direct, 39, 3, 3, word(constants), 1);  // SetComputeRoot32BitConstants(3, 3 values, offset 1) -> PC 35
+    raw(direct, 37, 3, 0xc4, 4);                 // one more right after them: one run of four
+    raw(direct, 31, word(bundle));               // ExecuteBundle -> PC 27, with the bundle's real list
+    EXPECT(direct_real->calls[27] == 1 && direct_real->args[27][0] == word(bundle_real));
+    const unsigned creates = mock->calls[12];
+    raw(direct, 74, word(&g_cells2[0]), 7, 1, 1);  // after the bundle's work: a cut
+    EXPECT(xs::list_proxy_part_count(direct) == 2 && mock->calls[12] == creates + 1);
+    Mock* const spare = mock->last_child;
+    EXPECT(spare->calls[25] == 1 && spare->args[25][0] == 0xB0B);
+    EXPECT(spare->calls[29] == 1 && spare->args[29][0] == 0x5678);
+    EXPECT(spare->calls[31] == 1 && spare->args[31][0] == 2 && spare->args[31][1] == 0x9000);
+    EXPECT(spare->calls[33] == 1 && spare->args[33][0] == 1 && spare->args[33][1] == 0x99 && spare->args[33][2] == 0);
+    // (UINT arguments: only the low halves of their registers are defined)
+    EXPECT(spare->calls[35] == 1 && std::uint32_t(spare->args[35][0]) == 3 && std::uint32_t(spare->args[35][1]) == 4 &&
+           std::uint32_t(spare->args[35][3]) == 1);
+    const auto* run = reinterpret_cast<const std::uint32_t*>(spare->args[35][2]);
+    EXPECT(run && run[0] == 0xc1 && run[1] == 0xc2 && run[2] == 0xc3 && run[3] == 0xc4);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    // 3. ClearState(pipeline) forgets what was set before it and sets its pipeline state.
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 25, 0x1234);
+    raw(direct, 33, 0x5678);
+    raw(direct, 11, 0x999);  // ClearState -> PC 11
+    raw(direct, 14, 1, 1, 1);
+    const unsigned spare_resets = spare->calls[10], spare_pipelines = spare->calls[25];
+    const unsigned spare_signatures = spare->calls[29], spare_constants = spare->calls[35];
+    raw(direct, 74, word(&g_cells2[0]), 7, 1, 1);  // a cut into the same spare
+    EXPECT(xs::list_proxy_part_count(direct) == 2 && spare->calls[10] == spare_resets + 1);
+    EXPECT(spare->calls[25] == spare_pipelines + 1 && spare->args[25][0] == 0x999);
+    EXPECT(spare->calls[29] == spare_signatures && spare->calls[35] == spare_constants);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    // 4. Writes land in submission order across queues. B's list waits for A's tag (relayed onto A's write fence)
+    // and then writes the next tag to the same cell: the GPU runs B's work after A's, so once B's fence is done A's
+    // is too. A pump that read A's fence before B's could see B done and A not, and land A's older tag last.
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 14, 1, 1, 1);
+    raw(direct, 72, word(&g_cells2[2]), 1, 0, 0);    // the tag
+    raw(direct, 72, word(&g_cells2[3]), 0xA, 0, 0);  // and a result next to it
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+    EXPECT(submit(qa, direct) == 0);
+    Mock* const a_written = mock->last_child;  // qa's value fences are made at this submission
+    EXPECT(a_written->kind == Kind::fence && fence_completed(a_written) == 0);
+    Mock* lb_real = nullptr;
+    void* lb = make_console_list(device, allocator, mock, &lb_real);
+    EXPECT(lb && hr_of(raw(lb, 9)) == S_OK);
+    EXPECT(hr_of(raw(lb, 139, word(allocator), 0)) == S_OK);
+    raw(lb, 74, word(&g_cells2[2]), 7, 1, 1);  // wait64(tag >= 1)
+    raw(lb, 14, 1, 1, 1);
+    raw(lb, 72, word(&g_cells2[2]), 2, 0, 0);  // the next tag
+    EXPECT(hr_of(raw(lb, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qb, lb) == 0);
+    Mock* const b_written = mock->last_child;
+    Mock* const b_gate = b_written - 1;
+    EXPECT(b_written->kind == Kind::fence && b_gate->kind == Kind::fence);
+    EXPECT(queue_call_is(0, qb_mock, 15, word(a_written), 1) && xs::list_value_stats().waits_relayed == 1);
+    EXPECT(!xs::list_values_idle(30) && cell2(2) == 0);
+    b_written->completes_with = a_written;  // the first look at B's fence once it is done finds A done as well
+    b_written->completes_at = 1;
+    b_written->completes_value = 1;
+    fence_signal(b_written, 1);
+    EXPECT(xs::list_values_idle(2000) && fence_completed(a_written) == 1);
+    EXPECT(cell2(2) == 2 && cell2(3) == 0xA);
+
+    // 5. Four gates in a row that time out give the short timeout to every wait whose address was never met (a new
+    // address each time here, so none times out three times on its own). A wait cut short and met in the rest of the
+    // full timeout keeps the full timeout for its address only; a gate cut short and met within its short timeout
+    // gives every wait the full timeout again.
+    xs::set_list_value_wait_timeout_ms(100);
+    xs::reset_list_value_stats();
+    const auto hold_on = [&](void* queue, int index, std::uint64_t reference) -> bool {
+        if (FAILED(hr_of(raw(lb, 139, word(allocator), 0)))) return false;
+        raw(lb, 74, word(&g_cells2[index]), 7, reference, 1);  // wait64(cell >= reference)
+        raw(lb, 14, 1, 1, 1);
+        return SUCCEEDED(hr_of(raw(lb, 9))) && submit(queue, lb) == 0;
+    };
+    const auto hold = [&](int index) { return hold_on(qb, index, 1); };  // a cell nothing writes
+    using Clock = std::chrono::steady_clock;
+    const auto ms_since = [](Clock::time_point since) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count();
+    };
+    const auto set_cell = [](int index, std::uint64_t value) {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells2[index]), static_cast<LONG64>(value));
+    };
+    for (int i = 0; i < 4; ++i) EXPECT(hold(4 + i) && xs::list_values_idle(3000));
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_held == 4 && stats.gates_timed_out == 4 && stats.demotions == 1 && stats.gates_short == 0);
+    Clock::time_point started = Clock::now();
+    EXPECT(hold(8) && xs::list_values_idle(3000) && ms_since(started) < 60);  // a new address: cut short
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_short == 1 && stats.gates_timed_out == 5 && stats.late_met == 0);
+    set_cell(8, 1);  // late, within the full timeout
+    for (int i = 0; i < 2000 && xs::list_value_stats().late_met == 0; ++i) Sleep(1);
+    EXPECT(xs::list_value_stats().late_met == 1);
+    started = Clock::now();
+    EXPECT(hold(9) && xs::list_values_idle(3000) && ms_since(started) < 60);  // still demoted for a new address
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_short == 2 && stats.gates_timed_out == 6 && stats.demotions == 1);
+    // Cell 8 was met before: it keeps the full timeout (met here after 30 ms, within it), and the demotion stays.
+    EXPECT(hold_on(qb, 8, 2) && !xs::list_values_idle(30));
+    set_cell(8, 2);
+    EXPECT(xs::list_values_idle(3000));
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_short == 2 && stats.gates_met == 1 && stats.gates_timed_out == 6);
+    started = Clock::now();
+    EXPECT(hold(10) && xs::list_values_idle(3000) && ms_since(started) < 60);
+    EXPECT(xs::list_value_stats().gates_short == 3);
+    // A gate cut short and met within its short timeout lifts the demotion (the write follows the submission at
+    // once; a slow machine may need another try).
+    bool lifted = false;
+    for (int i = 0; i < 3 && !lifted; ++i) {
+        const std::uint64_t met_before = xs::list_value_stats().gates_met;
+        EXPECT(hold(11 + i));
+        set_cell(11 + i, 1);
+        EXPECT(xs::list_values_idle(3000));
+        lifted = xs::list_value_stats().gates_met == met_before + 1;
+    }
+    EXPECT(lifted);
+    const std::uint64_t short_before = xs::list_value_stats().gates_short;
+    started = Clock::now();
+    EXPECT(hold(14) && !xs::list_values_idle(40));  // a new address, the full timeout again
+    EXPECT(xs::list_values_idle(3000) && ms_since(started) >= 90);
+    EXPECT(xs::list_value_stats().gates_short == short_before && xs::list_value_stats().demotions == 1);
+
+    // 6. CopyPageMappingsBatchX behind work the queue has not done: the call returns, and the remap (of a copy of
+    // the batches) runs once the queue gets there, before the gate its later work waits on opens. With the earlier
+    // work done it remaps at the call.
+    xs::set_copy_page_mappings_hook(&record_page_mapping);
+    g_page_mapping = {};
+    const rt::xmem::PageRange remap_ranges[] = {{0, 4, 2}, {2, 0, 6}};
+    const rt::xmem::PageBatch remap[] = {{0x9000000000, 2, remap_ranges}};
+    g_queue_call_count = 0;
+    started = Clock::now();
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);
+    const auto deferred_after = ms_since(started);
+    EXPECT(deferred_after >= 15 && deferred_after < 100);  // the 16 ms bound, on a high-resolution timer
+    Mock* const c_written = mock->last_child;
+    Mock* const c_gate = c_written - 1;
+    EXPECT(c_written->kind == Kind::fence && c_gate->kind == Kind::fence && g_page_mapping.count == 0);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qc_mock, 14, word(c_written), 1) &&
+           queue_call_is(1, qc_mock, 15, word(c_gate), 1));
+    EXPECT(!xs::list_values_idle(30) && fence_completed(c_gate) == 0 && g_page_mapping.count == 0);
+    // A memory wait behind the remap on the same queue: its time starts when the remap's gate opens, not at its
+    // submission (held 150 ms behind the remap, it does not open at once then).
+    const std::uint64_t timed_out_before = xs::list_value_stats().gates_timed_out;
+    EXPECT(hold_on(qc, 15, 1));
+    Sleep(150);
+    EXPECT(fence_completed(c_gate) == 0 && xs::list_value_stats().gates_timed_out == timed_out_before);
+    fence_signal(c_written, 1);
+    EXPECT(!xs::list_values_idle(40) && fence_completed(c_gate) == 1);
+    EXPECT(xs::list_values_idle(3000) && fence_completed(c_gate) == 2);
+    EXPECT(xs::list_value_stats().gates_timed_out == timed_out_before + 1);
+    EXPECT(g_page_mapping.count == 1 && g_page_mapping.batches != remap && g_page_mapping.pool == 0x7000000000 &&
+           g_page_mapping.pages == 16 && g_page_mapping.first_destination == 0x9000000000 &&
+           g_page_mapping.first_count == 2 && g_page_mapping.first_ranges[0].start == 4 &&
+           g_page_mapping.first_ranges[1].kind == 2 && g_page_mapping.first_ranges[1].count == 6);
+    stats = xs::list_value_stats();
+    EXPECT(stats.remaps_deferred == 1 && stats.remaps_now == 0 && stats.remaps_failed == 0);
+    qc_mock->signals_complete = true;  // the queue is idle: its Signal is done at once
+    g_page_mapping = {};
+    g_queue_call_count = 0;
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);
+    EXPECT(g_page_mapping.count == 1 && g_page_mapping.batches == remap && g_queue_call_count == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.remaps_deferred == 1 && stats.remaps_now == 1);
+    qc_mock->signals_complete = false;
+    xs::set_copy_page_mappings_hook(nullptr);
+    xs::set_list_value_wait_timeout_ms(5000);
+
+    // 7. Value stores: an aligned 4- or 8-byte value in one locked access (a reader polling it never sees half of
+    // each), an unaligned one byte by byte, memory that cannot be written reported, not raised.
+    alignas(8) static std::uint8_t bytes[32] = {};
+    EXPECT(leonida::kernel_writes::store(bytes, 0x1122334455667788ull, 8));
+    EXPECT(*reinterpret_cast<std::uint64_t*>(bytes) == 0x1122334455667788ull);
+    EXPECT(leonida::kernel_writes::store(bytes + 8, 0xaabbccdd11223344ull, 4));
+    EXPECT(*reinterpret_cast<std::uint32_t*>(bytes + 8) == 0x11223344u && bytes[12] == 0);
+    EXPECT(leonida::kernel_writes::store(bytes + 17, 0x0102030405060708ull, 8));
+    EXPECT(bytes[17] == 0x08 && bytes[24] == 0x01 && bytes[16] == 0 && bytes[25] == 0);
+    void* read_only = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+    EXPECT(read_only && !leonida::kernel_writes::store(read_only, 1, 8) &&
+           !leonida::kernel_writes::store(static_cast<std::uint8_t*>(read_only) + 1, 1, 8));
+    VirtualFree(read_only, 0, MEM_RELEASE);
+    const HANDLE reader = CreateThread(nullptr, 0, &tear_reader, nullptr, 0, nullptr);
+    EXPECT(reader);
+    for (int i = 0; i < 200000; ++i) leonida::kernel_writes::store(&g_tear.cell, (i & 1) ? ~0ull : 0, 8);
+    g_tear.stop = true;
+    WaitForSingleObject(reader, INFINITE);
+    CloseHandle(reader);
+    EXPECT(g_tear.torn == 0 && g_tear.reads > 0);
+
+    // 9. write64 flags 1 and 2 take the GPU's timestamp at the write's place in its list (EndQuery and a resolve of
+    // that one slot into the readback), landed once the part's fence passed: flag 1 in the queue's timestamp ticks (a
+    // begin/end pair is the GPU work's, not one landing time), flag 2 as the QPC value the queue's clock calibration
+    // gives. A pre-write that lands before its part ran (the gate is held) takes the CPU's clock instead.
+    xs::reset_list_value_stats();
+    xs::set_list_value_wait_timeout_ms(5000);
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    const unsigned end_queries = direct_real->calls[53], resolves = direct_real->calls[54];
+    raw(direct, 72, word(&g_cells2[20]), 0, 0, 1);  // begin
+    raw(direct, 14, 1, 1, 1);
+    raw(direct, 72, word(&g_cells2[21]), 0, 0, 1);  // end
+    raw(direct, 72, word(&g_cells2[22]), 0, 0, 2);  // the system's timestamp
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+    EXPECT(direct_real->calls[53] == end_queries + 3 && direct_real->calls[54] == resolves + 3);
+    const auto last = static_cast<std::uint32_t>(direct_real->args[53][2]);  // EndQuery(heap, type, slot)
+    EXPECT(std::uint32_t(direct_real->args[53][1]) == D3D12_QUERY_TYPE_TIMESTAMP && last >= 2 && last < 4096);
+    EXPECT(direct_real->args[54][0] == direct_real->args[53][0] &&  // ResolveQueryData(heap, type, first, count,
+           std::uint32_t(direct_real->args[54][2]) == last &&      //                  readback, offset)
+           std::uint32_t(direct_real->args[54][3]) == 1 && direct_real->args[54][5] == std::uint64_t{last} * 8);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, direct) == 0);
+    const std::uint64_t stamped = logged_signal(qa_mock, a_written);
+    EXPECT(stamped && cell2(20) == 0 && cell2(21) == 0);
+    g_mock_readback[last - 2] = kMockGpu0 + 1000;  // as the GPU resolves them: 1 MHz ticks
+    g_mock_readback[last - 1] = kMockGpu0 + 4000;  // 3 ms of GPU work later
+    g_mock_readback[last] = kMockGpu0 - 2000;      // 2 ms before the calibration point
+    fence_signal(a_written, stamped);
+    EXPECT(xs::list_values_idle(2000));
+    EXPECT(cell2(20) == kMockGpu0 + 1000 && cell2(21) == kMockGpu0 + 4000);
+    LARGE_INTEGER qpc_frequency{}, qpc_now{};
+    QueryPerformanceFrequency(&qpc_frequency);
+    QueryPerformanceCounter(&qpc_now);
+    EXPECT(cell2(22) == mock_cpu_origin() - 2000 * static_cast<std::uint64_t>(qpc_frequency.QuadPart) / 1000000 &&
+           cell2(22) <= static_cast<std::uint64_t>(qpc_now.QuadPart));
+    stats = xs::list_value_stats();
+    EXPECT(stats.stamps_gpu == 3 && stats.stamps_cpu == 0);
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 72, word(&g_cells2[23]), 0, 0, 1);  // a timestamp, then a wait: a pre-write
+    raw(direct, 74, word(&g_cells2[24]), 7, 1, 1);  // unmet: the gate holds the part
+    raw(direct, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+    const auto pre_slot = static_cast<std::uint32_t>(direct_real->args[53][2]);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, direct) == 0);
+    const std::uint64_t pre = logged_signal(qa_mock, a_written);
+    // The pre-write's group is signalled, then the queue stands at the gate, then the part.
+    EXPECT(pre && g_queue_call_count == 3 && queue_call_is(0, qa_mock, 14, word(a_written), pre) &&
+           g_queue_calls[1].slot == 15 && g_queue_calls[1].a1 == word(a_written - 1));
+    g_mock_readback[pre_slot] = 77;  // what the part writes once it runs: not there when the pre-write lands
+    fence_signal(a_written, pre);
+    for (int i = 0; i < 2000 && cell2(23) == 0; ++i) Sleep(1);
+    EXPECT(cell2(23) != 0 && cell2(23) != 77 && xs::list_value_stats().stamps_cpu == 1);
+    set_cell(24, 1);
+    EXPECT(xs::list_values_idle(3000));
+
+    // 10. A GPU wait for a label a CPU job of the title's writes later never blocks the submitting thread: the
+    // submission returns at once with the gate held (with a 5 s timeout), a submission behind it on the same queue
+    // returns at once too, and the CPU job's write (on another thread, 100 ms later) opens the gate.
+    const std::uint64_t met_before = xs::list_value_stats().gates_met;
+    started = Clock::now();
+    EXPECT(hold(25));
+    const HANDLE job = CreateThread(nullptr, 0, &label_job, &g_cells2[25], 0, nullptr);
+    EXPECT(job);
+    EXPECT(hold_on(qb, 26, 0) && ms_since(started) < 50);  // a met wait: the plain way, behind the held gate
+    EXPECT(!xs::list_values_idle(40) && xs::list_value_stats().gates_met == met_before);
+    EXPECT(xs::list_values_idle(3000) && xs::list_value_stats().gates_met == met_before + 1 &&
+           ms_since(started) >= 90);
+    WaitForSingleObject(job, INFINITE);
+    CloseHandle(job);
+
+    // 8. stop() ends both threads. Afterwards nothing new is landed or opened (the process is ending: a gate
+    // signalled from another thread could open one whose remap was skipped, or go below one still to come), and
+    // CopyPageMappingsBatchX remaps at the call rather than wait for a queue whose gates stay shut.
+    xs::stop_list_values(2000);
+    const std::uint64_t gates_before = fence_completed(b_gate);
+    EXPECT(hold(16));
+    Sleep(20);
+    EXPECT(fence_completed(b_gate) == gates_before);
+    xs::set_copy_page_mappings_hook(&record_page_mapping);
+    g_page_mapping = {};
+    started = Clock::now();
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);  // its point is never reached
+    EXPECT(g_page_mapping.count == 1 && g_page_mapping.batches == remap && ms_since(started) < 1000);
+    xs::set_copy_page_mappings_hook(nullptr);
+
+    EXPECT(release(off) == 0 && off_real->refs == 0);
+    EXPECT(release(bundle) == 0 && bundle_real->refs == 0);
+    EXPECT(release(direct) == 0 && direct_real->refs == 0 && spare->refs == 0);
+    EXPECT(release(lb) == 0 && lb_real->refs == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(qa) == 0 && release(qb) == 0 && release(qc) == 0);
+    EXPECT(qa_mock->refs == 0 && qb_mock->refs == 0 && qc_mock->refs == 0);
+    EXPECT(a_written->refs == 0 && b_written->refs == 0 && b_gate->refs == 0 && c_written->refs == 0 &&
+           c_gate->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: with LEONIDA_LIST_VALUES=0 and on bundles writes and waits are no-ops, a bundle's and "
+                "ClearState's state carry over a cut, writes land in submission order across queues, timeouts in a "
+                "row shorten the waits for addresses never met until one cut short is met, a gate's time starts at "
+                "its queue's head, a page remap behind held work is deferred, value stores do not tear, and nothing "
+                "is opened after stop(); timestamp writes land the GPU's timestamps, and a wait for a label a CPU job "
+                "writes later never blocks the submitting thread\n",
+                g_label);
+    return 0;
+}
+
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
 // exception that escapes, for one), the debug CRT's reports, and Windows' fault and critical-error boxes.
 static void no_dialogs() {
@@ -4109,7 +4990,9 @@ int main(int argc, char** argv) {
         check_list_cpu_handles() ||
         check_presentation_wiring() || check_queue_copy_page_mappings())
         return 1;
-    if (check_placed_resource_x()) return 1;
+    if (check_placed_resource_x() || check_depth_provider_refusal()) return 1;
+    if (check_list_values()) return 1;       // last: it starts the list-values threads
+    if (check_list_values_more()) return 1;  // and this one stops them
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
 }

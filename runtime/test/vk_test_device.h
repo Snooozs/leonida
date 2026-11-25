@@ -8,6 +8,7 @@
 #include "../src/queue_families.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
+#include "../src/vulkan_index_view.h"
 #include "vk_device_pick.h"
 #include "../src/subgroup_size.h"
 
@@ -123,6 +124,11 @@ public:
     bool prepare_on_bind=false;
     bool cold_graphics_compile = false;
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
+    bool request_multi_draw_indirect = false, request_draw_indirect_count = false;
+    bool draw_indirect_count_enabled = false;
+    bool request_robust_index_view = false, robust_index_view = false;
+    std::uint32_t max_draw_indirect_count = 0;
+    bool request_draw_indirect_first_instance = false; // enable the core feature only for positive indirect draws
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
@@ -136,6 +142,8 @@ public:
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
     bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
+    bool request_null_descriptor = false;  // set before initialize(): enable VK_EXT_robustness2 nullDescriptor
+    bool null_descriptor = false;          // VK_EXT_robustness2 and nullDescriptor are enabled
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
     VkDeviceSize host_pointer_alignment = 0;
 
@@ -411,6 +419,9 @@ private:
         }
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
+        max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
+        draw_indirect_count_enabled = request_draw_indirect_count && features12.drawIndirectCount == VK_TRUE;
+        enable12.drawIndirectCount = draw_indirect_count_enabled;
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
         buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
@@ -466,6 +477,8 @@ private:
         VkPhysicalDeviceFeatures enable{};
         storage_image_extended_formats = features.features.shaderStorageImageExtendedFormats == VK_TRUE;
         enable.shaderStorageImageExtendedFormats = storage_image_extended_formats;
+        if (request_multi_draw_indirect) enable.multiDrawIndirect = features.features.multiDrawIndirect;
+        if (request_draw_indirect_first_instance) enable.drawIndirectFirstInstance = features.features.drawIndirectFirstInstance;
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;
@@ -478,6 +491,7 @@ private:
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
+        enable.dualSrcBlend = features.features.dualSrcBlend;  // d3d12_translated_draw_test --dual-source
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -570,10 +584,6 @@ private:
             a8_render_target =
                 maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
         }
-        if (a8_render_target) {
-            maintenance5.pNext = *v13_.next();
-            *v13_.next() = &maintenance5;
-        }
 #endif
 
         const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
@@ -645,6 +655,47 @@ private:
             *v13_.next() = &custom_border;
         }
 
+        // Query just the requested robustness features (null descriptors and bounded indexed draws).
+        VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        for (const auto& extension : extensions) {
+            if ((!request_null_descriptor && !request_robust_index_view) ||
+                std::strcmp(extension.extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) != 0)
+                continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            null_descriptor = request_null_descriptor && robustness2.nullDescriptor;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+            robust_index_view = leonida::can_enable_robust_index_view(
+                physical, instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
+                request_robust_index_view && enable.drawIndirectFirstInstance && maintenance5.maintenance5,
+                features.features.robustBufferAccess && robustness2.robustBufferAccess2, bindless);
+#endif
+        }
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (a8_render_target || robust_index_view) {
+            maintenance5.pNext = *v13_.next();
+            *v13_.next() = &maintenance5;
+        }
+#endif
+        if (null_descriptor || robust_index_view) {
+            robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            robustness2.nullDescriptor = null_descriptor;
+            robustness2.robustBufferAccess2 = robust_index_view;
+            enable.robustBufferAccess = robust_index_view;
+            robustness2.pNext = *v13_.next();
+            *v13_.next() = &robustness2;
+        }
+
+        // VK_EXT_external_memory_host where the device has it (OpenExistingHeapFromAddress).
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -666,7 +717,7 @@ private:
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
-        if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+        if (a8_render_target || robust_index_view) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
         if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         if (sliced_3d_uav) device_extensions.push_back(sliced_name);
@@ -714,6 +765,7 @@ private:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        if (null_descriptor || robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();

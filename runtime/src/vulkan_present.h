@@ -659,6 +659,8 @@ private:
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             const auto shown = ++presented_;
+            submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
+            submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
             if (dump_.due(shown - 1)) {
                 // Presentation is already queued and the queue/tracker locks are released. A sampled frame
                 // may stall here for its transfer fence and a private CPU copy. PNG and disk I/O run on a worker.

@@ -1116,7 +1116,7 @@ def fmt_sint32_test(tools, spirv, env=None):
 
 
 def fmt_all_test(tools, spirv, env=None):
-    """cs_fmt_all: 28 loads, the inputs, 15 stores, and the untouched words between (316 words in all). Wave32, one
+    """cs_fmt_all: 32 loads, the inputs, 20 stores, and the untouched words between (336 words in all). Wave32, one
     thread: the translator recorded 32 for it, so the run is pinned to a 32-wide subgroup like compute_test does."""
     env = dict(os.environ if env is None else env)
     env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_fmt_all") or 32))

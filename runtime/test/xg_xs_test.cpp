@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <cstring>
 #include <vector>
 
@@ -396,21 +397,42 @@ int main() {
         std::uint64_t cursor = 0;
         std::vector<int> polled;
         const auto visit = [&](Entry& t) { polled.push_back(t.id); };
-        leonida::poll_title_textures(entries, cursor, visit, [&] { return !polled.empty(); });
+        const auto poll = [&](auto exhausted) {
+            const auto snapshot = leonida::title_texture_snapshot(entries);
+            leonida::poll_title_textures(snapshot, cursor, visit, exhausted);
+        };
+        poll([&] { return !polled.empty(); });
         check(polled == std::vector<int>{1}, "budget stops after a background texture");
         entries.erase(10);
         entries[50] = &added;
-        leonida::poll_title_textures(entries, cursor, visit, [&] { return polled.size() == 2; });
+        poll([&] { return polled.size() == 2; });
         check(polled == std::vector<int>{1, 4}, "poll resumes after deletion and skips priority textures");
         polled.clear();
-        leonida::poll_title_textures(entries, cursor, visit, [] { return false; });
+        poll([] { return false; });
         check(polled == std::vector<int>{5, 4}, "unlimited poll wraps once and includes new textures");
         cursor = 20;
         polled.clear();
-        for (unsigned pass = 0; pass < 3; ++pass)
-            leonida::poll_title_textures(entries, cursor, visit, [] { return true; });
+        for (unsigned pass = 0; pass < 3; ++pass) poll([] { return true; });
         check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
 
+        // A fill made during a pass submits, and that submission destroys a retired image whose destructor erases its
+        // registry entry; the registry mutex is recursive for its owner on Windows, so the erase lands inside the pass.
+        // A walk over a snapshot keeps every entry of the pass alive and in order, which a walk over the registry
+        // itself cannot do: its iterator steps into a freed node.
+        std::map<std::uint64_t, std::shared_ptr<Entry>> registry;
+        for (std::uint64_t address = 1; address <= 32; ++address)
+            registry[address * 16] = std::make_shared<Entry>(Entry{false, false, int(address)});
+        std::vector<int> walked;
+        const auto pass = leonida::title_texture_snapshot(registry);
+        for (const auto& entry : pass) {
+            walked.push_back(entry.second->id);
+            registry.erase(entry.first);                 // a retired image whose entry leaves mid-pass
+            registry[entry.first + 1] = entry.second;    // and an image re-registered at the next address
+        }
+        std::vector<int> every(32);
+        for (int i = 0; i < 32; ++i) every[i] = i + 1;
+        check(walked == every, "a pass walks every entry once even when a visit erases and re-registers");
+        check(registry.size() == 32, "the registry kept the re-registrations made during the pass");
     }
 
     {
@@ -492,6 +514,42 @@ int main() {
     test_layout_model();
     test_bijection_and_round_trip();
     test_models_agree();
+    ResourceDesc exposure{3, 0, 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, 0x100, 0x100001};
+    void* target = nullptr;
+    if (!make(create, exposure, target, "create exposure readback render target")) return 1;
+    ResourceLayout exposure_layout{};
+    check(slot<LayoutFn>(target, 2)(target, &exposure_layout) == S_OK, "exposure slot 2 returns layout");
+    const auto& plane = exposure_layout.plane[0];
+    const auto& mip = plane.mips[0];
+    check(exposure_layout.planes == 1 && exposure_layout.mips == 1 && plane.offset == 0 && mip.offset == 0,
+          "first plane and mip start at the returned Map pointer");
+    check(exposure_layout.size == 256 && mip.pitch_bytes == 256 && mip.slice_bytes == 256 && mip.size == 256,
+          "one RGBA32F texel occupies one aligned linear row");
+    slot<RefFn>(target, 1)(target);
+    for (uint32_t flags : {kRenderTarget, kRenderTarget | 0x300000u}) {
+        auto variant = exposure;
+        variant.flags = flags;
+        if (!make(create, variant, target, "linear render target with console flag variants")) return 1;
+        ResourceLayout layout{};
+        check(slot<LayoutFn>(target, 2)(target, &layout) == S_OK &&
+              !std::memcmp(&layout, &exposure_layout, sizeof(layout)), "console flag variants have identical footprints");
+        slot<RefFn>(target, 1)(target);
+    }
+    for (unsigned i = 0; i < 5; ++i) {
+        auto other = exposure;
+        switch (i) {
+        case 0: other.width = 2; break;
+        case 1: other.layout = 0x11b; break;
+        case 2: other.flags |= kDepthStencil; break;
+        case 3: other.samples = 4; break;
+        case 4: other.format = DXGI_FORMAT_R8_UNORM; break;
+        }
+        Texture primary{};
+        check(!build_texture(other, primary), "the linear readback shortcut excludes other target layouts");
+        target = nullptr;
+        check(create(&other, &target) == S_OK && target, "the other render targets still use the general layout model");
+        if (target) slot<RefFn>(target, 1)(target);
+    }
 
     ResourceDesc d{3, 0, 256, 128, 1, 1, DXGI_FORMAT_R8_UNORM, 1, 0, 0, 0};
     check(suggest(&d, 0, &d.layout) == S_OK && d.layout == 0x105, "2D SRV selects SW_4KB_S with aliased output");
